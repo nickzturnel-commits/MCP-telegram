@@ -10,16 +10,18 @@
 import asyncio
 import base64
 import functools
+import html
 import io
 import json
 import os
 import pathlib
 import time
+import uuid
 from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP, Image
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import HTMLResponse, PlainTextResponse
 from telethon import TelegramClient, functions, types, utils
 
 API_ID = int(os.environ["TELEGRAM_API_ID"])
@@ -362,10 +364,12 @@ async def delete_messages(chat: str, message_ids: list[int], for_everyone: bool 
 
 
 @write_tool
-async def forward_messages(from_chat: str, to_chat: str, message_ids: list[int]) -> str:
-    """Переслать сообщения."""
+async def forward_messages(from_chat: str, to_chat: str, message_ids: list[int],
+                           hide_sender: bool = False) -> str:
+    """Переслать сообщения. hide_sender=True — без подписи «переслано от» (как копия)."""
     c = await tg()
-    await c.forward_messages(peer(to_chat), message_ids, from_peer=peer(from_chat))
+    await c.forward_messages(peer(to_chat), message_ids, from_peer=peer(from_chat),
+                             drop_author=hide_sender)
     return "Переслано."
 
 
@@ -579,6 +583,170 @@ async def set_username(username: str) -> str:
     c = await tg()
     await c(functions.account.UpdateUsernameRequest(username=username.lstrip("@")))
     return "Username обновлён."
+
+
+# ================================================================ ЗАГРУЗКА ФАЙЛОВ (мост с твоего устройства)
+UPLOAD_DIR = pathlib.Path("/tmp/uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD = 50 * 1024 * 1024  # 50 МБ на файл
+
+
+def _upload_page(msg: str = "") -> str:
+    items = []
+    for p in sorted(UPLOAD_DIR.glob("*__*"), key=lambda x: x.stat().st_mtime, reverse=True):
+        uid, name = p.name.split("__", 1)
+        items.append(f"<li><code>{html.escape(uid)}</code> — {html.escape(name)} ({p.stat().st_size} Б)</li>")
+    return f"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Загрузка для Claude</title>
+<body style="font-family:system-ui;max-width:560px;margin:2rem auto;padding:0 1rem">
+<h2>Загрузить файл для отправки в Telegram</h2>
+<form method="post" enctype="multipart/form-data">
+<input type="file" name="file" multiple required>
+<button type="submit">Загрузить</button></form>
+<p>{msg}</p>
+<p>Потом скажи Claude: «отправь файл &lt;id&gt; такому-то».</p>
+<h3>Загружено</h3><ul>{''.join(items) or '<li>пока пусто</li>'}</ul></body>"""
+
+
+@mcp.custom_route(f"/upload/{SECRET}", methods=["GET", "POST"])
+async def upload(request: Request):
+    if request.method == "POST":
+        form = await request.form()
+        done = []
+        for f in form.getlist("file"):
+            data = await f.read()
+            if len(data) > MAX_UPLOAD:
+                done.append(f"{html.escape(f.filename or 'файл')}: слишком большой (>50 МБ)")
+                continue
+            uid = uuid.uuid4().hex[:8]
+            name = pathlib.Path(f.filename or "file").name
+            (UPLOAD_DIR / f"{uid}__{name}").write_bytes(data)
+            done.append(f"✅ <b>{uid}</b> — {html.escape(name)}")
+        return HTMLResponse(_upload_page("<br>".join(done)))
+    return HTMLResponse(_upload_page())
+
+
+def _find_upload(uid: str) -> pathlib.Path:
+    uid = uid.strip()
+    for p in UPLOAD_DIR.glob(f"{uid}__*"):
+        return p
+    raise FileNotFoundError(f"Загрузка {uid} не найдена (после перезапуска сервера загрузки пропадают).")
+
+
+def _load_upload(uid: str) -> io.BytesIO:
+    p = _find_upload(uid)
+    f = io.BytesIO(p.read_bytes())
+    f.name = p.name.split("__", 1)[1]
+    return f
+
+
+@mcp.tool()
+async def list_uploads() -> str:
+    """Файлы, которые пользователь загрузил через страницу /upload (id, имя, размер)."""
+    out = []
+    for p in sorted(UPLOAD_DIR.glob("*__*"), key=lambda x: x.stat().st_mtime, reverse=True):
+        uid, name = p.name.split("__", 1)
+        out.append({"id": uid, "name": name, "size": p.stat().st_size})
+    return j(out)
+
+
+@write_tool
+async def send_uploaded(chat: str, upload_id: str, caption: str = "", as_document: bool = False,
+                        voice_note: bool = False, reply_to: int | None = None,
+                        delete_after: bool = True) -> str:
+    """Отправить в Telegram файл, загруженный через страницу /upload (по его id)."""
+    c = await tg()
+    f = _load_upload(upload_id)
+    m = await c.send_file(peer(chat), f, caption=caption, force_document=as_document,
+                          voice_note=voice_note, reply_to=reply_to)
+    if delete_after:
+        _find_upload(upload_id).unlink(missing_ok=True)
+    return f"Отправлено, id={m.id}"
+
+
+@write_tool
+async def send_album(chat: str, upload_ids: list[str] | None = None, file_urls: list[str] | None = None,
+                     caption: str = "", reply_to: int | None = None) -> str:
+    """Отправить несколько фото/файлов одним альбомом (из загрузок и/или по ссылкам)."""
+    c = await tg()
+    files = [_load_upload(u) for u in (upload_ids or [])] + list(file_urls or [])
+    if not files:
+        return "Нужны upload_ids или file_urls."
+    await c.send_file(peer(chat), files, caption=caption, reply_to=reply_to)
+    return f"Отправлено файлов: {len(files)}"
+
+
+@write_tool
+async def delete_upload(upload_id: str) -> str:
+    """Удалить загруженный файл с сервера."""
+    _find_upload(upload_id).unlink(missing_ok=True)
+    return "Удалено."
+
+
+# ================================================================ ДОПОЛНИТЕЛЬНЫЕ ВОЗМОЖНОСТИ
+@write_tool
+async def copy_messages(from_chat: str, to_chat: str, message_ids: list[int]) -> str:
+    """Скопировать сообщения в другой чат БЕЗ пометки «переслано» (текст + вложения)."""
+    c = await tg()
+    to = peer(to_chat)
+    msgs = await c.get_messages(peer(from_chat), ids=message_ids)
+    n = 0
+    for m in msgs:
+        if not m:
+            continue
+        try:
+            if m.media and not isinstance(m.media, types.MessageMediaWebPage):
+                await c.send_file(to, m.media, caption=m.message or "", formatting_entities=m.entities)
+            else:
+                await c.send_message(to, m.message or "", formatting_entities=m.entities)
+        except Exception:  # noqa: BLE001
+            await c.forward_messages(to, m, drop_author=True)
+        n += 1
+    return f"Скопировано сообщений: {n}"
+
+
+@write_tool
+async def send_location(chat: str, latitude: float, longitude: float) -> str:
+    """Отправить геопозицию."""
+    c = await tg()
+    await c.send_file(peer(chat), types.InputMediaGeoPoint(types.InputGeoPoint(latitude, longitude)))
+    return "Геопозиция отправлена."
+
+
+@write_tool
+async def send_contact(chat: str, phone: str, first_name: str, last_name: str = "") -> str:
+    """Отправить карточку контакта."""
+    c = await tg()
+    await c.send_file(peer(chat), types.InputMediaContact(
+        phone_number=phone, first_name=first_name, last_name=last_name, vcard=""))
+    return "Контакт отправлен."
+
+
+@write_tool
+async def send_poll(chat: str, question: str, answers: list[str], multiple: bool = False,
+                    anonymous: bool = True) -> str:
+    """Создать опрос (2–10 вариантов)."""
+    c = await tg()
+    try:  # новый формат (TextWithEntities)
+        poll = types.Poll(
+            id=0, question=types.TextWithEntities(question, []), public_voters=not anonymous,
+            multiple_choice=multiple,
+            answers=[types.PollAnswer(types.TextWithEntities(a, []), bytes([i])) for i, a in enumerate(answers)])
+    except TypeError:  # старый формат (строки)
+        poll = types.Poll(
+            id=0, question=question, public_voters=not anonymous, multiple_choice=multiple,
+            answers=[types.PollAnswer(a, bytes([i])) for i, a in enumerate(answers)])
+    await c.send_message(peer(chat), file=types.InputMediaPoll(poll=poll))
+    return "Опрос создан."
+
+
+@mcp.tool()
+async def transcribe_voice(chat: str, message_id: int) -> str:
+    """Расшифровать голосовое/кружок в текст (нужен Telegram Premium или остаток бесплатных попыток)."""
+    c = await tg()
+    r = await c(functions.messages.TranscribeAudioRequest(
+        peer=await c.get_input_entity(peer(chat)), msg_id=message_id))
+    return j({"text": r.text, "pending": r.pending})
 
 
 if __name__ == "__main__":
