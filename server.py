@@ -727,15 +727,25 @@ async def send_poll(chat: str, question: str, answers: list[str], multiple: bool
                     anonymous: bool = True) -> str:
     """Создать опрос (2–10 вариантов)."""
     c = await tg()
-    try:  # новый формат (TextWithEntities)
-        poll = types.Poll(
-            id=0, question=types.TextWithEntities(question, []), public_voters=not anonymous,
-            multiple_choice=multiple,
-            answers=[types.PollAnswer(types.TextWithEntities(a, []), bytes([i])) for i, a in enumerate(answers)])
-    except TypeError:  # старый формат (строки)
-        poll = types.Poll(
-            id=0, question=question, public_voters=not anonymous, multiple_choice=multiple,
-            answers=[types.PollAnswer(a, bytes([i])) for i, a in enumerate(answers)])
+    new_ans = [types.PollAnswer(types.TextWithEntities(a, []), bytes([i])) for i, a in enumerate(answers)]
+    old_ans = lambda: [types.PollAnswer(a, bytes([i])) for i, a in enumerate(answers)]  # noqa: E731
+    attempts = [  # от самого нового формата Telethon к старому
+        lambda: types.Poll(id=0, question=types.TextWithEntities(question, []), answers=new_ans, hash=0,
+                           public_voters=not anonymous, multiple_choice=multiple),
+        lambda: types.Poll(id=0, question=types.TextWithEntities(question, []), answers=new_ans,
+                           public_voters=not anonymous, multiple_choice=multiple),
+        lambda: types.Poll(id=0, question=question, answers=old_ans(),
+                           public_voters=not anonymous, multiple_choice=multiple),
+    ]
+    poll, last_err = None, None
+    for make in attempts:
+        try:
+            poll = make()
+            break
+        except TypeError as e:
+            last_err = e
+    if poll is None:
+        return f"Не удалось собрать опрос: {last_err}"
     await c.send_message(peer(chat), file=types.InputMediaPoll(poll=poll))
     return "Опрос создан."
 
