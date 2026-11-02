@@ -17,7 +17,7 @@ import pathlib
 import time
 from datetime import datetime, timezone
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from telethon import TelegramClient, functions, types, utils
@@ -285,6 +285,43 @@ async def download_media(chat: str, message_id: int, max_mb: int = 5) -> str:
     data = await c.download_media(m, file=bytes)
     return j({"file_name": m.file.name if m.file else None, "mime": m.file.mime_type if m.file else None,
               "size": len(data), "base64": base64.b64encode(data).decode()})
+
+
+@mcp.tool()
+async def view_media(chat: str, message_id: int, max_mb: int = 8):
+    """Посмотреть фото/картинку из сообщения или историю (stories): возвращает изображение.
+    Видео, стикеры-анимации и голосовые не поддерживаются (вернёт пояснение)."""
+    c = await tg()
+    m = await c.get_messages(peer(chat), ids=message_id)
+    if not m or not m.media:
+        return "В сообщении нет вложения."
+    media = m.media
+
+    # История (story): берём медиа из неё
+    if isinstance(media, types.MessageMediaStory):
+        story = getattr(media, "story", None)
+        if story is None or not hasattr(story, "media"):
+            res = await c(functions.stories.GetStoriesByIDRequest(
+                peer=await c.get_input_entity(media.peer), id=[media.id]))
+            story = res.stories[0] if res.stories else None
+        if story is None or not hasattr(story, "media"):
+            return "История недоступна (удалена, истекла или скрыта)."
+        media = story.media
+
+    mime = None
+    is_photo = isinstance(media, types.MessageMediaPhoto)
+    if isinstance(media, types.MessageMediaDocument) and getattr(media, "document", None):
+        mime = media.document.mime_type
+    if not is_photo and not (mime and mime.startswith("image/")):
+        return f"Это не неподвижная картинка ({mime or type(media).__name__}), показать её я не могу."
+
+    data = await c.download_media(media, file=bytes)
+    if not data:
+        return "Не удалось скачать файл."
+    if len(data) > max_mb * 1024 * 1024:
+        return f"Изображение слишком большое ({len(data)} байт), лимит {max_mb} МБ."
+    fmt = "jpeg" if is_photo else mime.split("/")[1].replace("jpg", "jpeg")
+    return Image(data=data, format=fmt)
 
 
 @mcp.tool()
