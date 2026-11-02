@@ -1,0 +1,6 @@
+*.session
+*.session-journal
+session_b64.txt
+login.py
+__pycache__/
+.env
