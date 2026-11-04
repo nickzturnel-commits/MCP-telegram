@@ -1,2 +1,4 @@
 telethon>=1.37
 mcp>=1.12,<2
+httpx
+python-multipart
