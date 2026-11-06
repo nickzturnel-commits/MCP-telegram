@@ -2935,7 +2935,7 @@ async def render_get_service_events(minutes: int = 60, limit: int = 100,
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=max(1, min(int(minutes), 24 * 60)))
     payload = await _render_request(f"/services/{quote(sid, safe='')}/events", params={
-        "startTime": start.isoformat(), "endTime": end.isoformat(), "limit": max(1, min(int(limit), 100))})
+        "startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "endTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": max(1, min(int(limit), 100))})
     return j({"service_id": sid, "start_time": start.isoformat(), "end_time": end.isoformat(), "events": payload})
 
 
